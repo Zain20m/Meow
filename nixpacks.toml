@@ -1,5 +1,6 @@
+
 [phases.setup]
-nixPkgs = ["nodejs_22", "python312"]
+nixPkgs = ["nodejs", "python312"]
 
 [phases.install]
 cmds = ["npm install --omit=dev --no-audit --no-fund"]
