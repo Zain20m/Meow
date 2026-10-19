@@ -1,9 +1,10 @@
 
 #!/usr/bin/env node
+
 /**
  * 24/7 Discord bot watchdog.
- * Railway: BOT_ONLY=1 binds PORT and keeps the bot alive.
- * Preview: no HTTP bind unless configured.
+ * Railway: BOT_ONLY=1 binds PORT and keeps the bot alive forever.
+ * Preview: no HTTP bind (Vite owns 8080); still restarts the bot if it dies.
  */
 
 import fs from "node:fs";
@@ -25,18 +26,21 @@ const WATCHDOG = path.join(DATA, "watchdog.pid");
 
 fs.mkdirSync(DATA, { recursive: true });
 
-// Diagnose Python inside the actual Railway container.
+// Diagnose Python in the actual Railway container.
 const pythonCheck = spawnSync("/usr/bin/python3", ["--version"], {
   encoding: "utf8",
   timeout: 5000,
 });
 
-console.log("[PYTHON CHECK]", JSON.stringify({
-  status: pythonCheck.status,
-  error: pythonCheck.error?.message ?? null,
-  stdout: pythonCheck.stdout?.trim() ?? "",
-  stderr: pythonCheck.stderr?.trim() ?? "",
-}));
+console.log(
+  "[PYTHON CHECK]",
+  JSON.stringify({
+    status: pythonCheck.status,
+    error: pythonCheck.error?.message ?? null,
+    stdout: pythonCheck.stdout?.trim() ?? "",
+    stderr: pythonCheck.stderr?.trim() ?? "",
+  })
+);
 
 const botOnly =
   process.env.BOT_ONLY === "1" ||
@@ -77,6 +81,7 @@ const CONFIG = path.join(DATA, "bot-secrets.json");
 
 function appIdFromToken(token) {
   const part = String(token || "").split(".")[0];
+
   if (!part) return "";
 
   try {
@@ -108,9 +113,9 @@ function readToken() {
 
   const appId = String(
     file.appId ||
-    process.env.DISCORD_APP_ID ||
-    appIdFromToken(token) ||
-    ""
+      process.env.DISCORD_APP_ID ||
+      appIdFromToken(token) ||
+      ""
   ).trim();
 
   return { token, appId, mtime };
@@ -155,20 +160,21 @@ function spawnBot() {
 
   if (child && child.exitCode === null) return;
 
+  const vendor = path.join(ROOT, "vendor");
+
   const extras = [
-    path.join(ROOT, "vendor", "bin"),
-    path.join(ROOT, "vendor", "Deobfuscator-Luraph-V15-adi", "bin"),
-    path.join(ROOT, "vendor", "luraph-v15-node", "bin"),
-    path.join(ROOT, "vendor", "6vms"),
+    path.join(vendor, "bin"),
+    path.join(vendor, "Deobfuscator-Luraph-V15-adi", "bin"),
+    path.join(vendor, "luraph-v15-node", "bin"),
+    path.join(vendor, "6vms"),
     path.join(
-      ROOT,
-      "vendor",
+      vendor,
       "MoonSecV3DeobfuscatorDiscordBot-main",
       "bin"
     ),
   ];
 
-  // Keep the system locations available after adding vendor tools.
+  // Preserve system directories so Python and other system tools remain discoverable.
   const systemPaths = [
     "/usr/local/bin",
     "/usr/bin",
@@ -183,9 +189,11 @@ function spawnBot() {
     PATH: [...extras, ...systemPaths].join(path.delimiter),
     PYTHON_BIN: process.env.PYTHON_BIN || "/usr/bin/python3",
     PYTHONPATH: [
-      path.join(ROOT, "vendor", "luau-vmp-deobf"),
+      path.join(vendor, "luau-vmp-deobf"),
       process.env.PYTHONPATH || "",
-    ].filter(Boolean).join(path.delimiter),
+    ]
+      .filter(Boolean)
+      .join(path.delimiter),
     PYTHONUNBUFFERED: "1",
   };
 
@@ -235,11 +243,14 @@ function spawnBot() {
       writeJson(STATUS, {
         online: false,
         error:
-          "Invalid bot token. Reset it in the Discord Developer Portal and update your configuration.",
+          "Invalid bot token. Update the token in the Discord Developer Portal configuration.",
         updatedAt: Date.now(),
       });
 
-      console.log("[watchdog] token rejected — waiting for a new token");
+      console.log(
+        "[watchdog] token rejected — waiting for a new token"
+      );
+
       return;
     }
 
@@ -252,6 +263,7 @@ function spawnBot() {
     if (stopped) return;
 
     crashes += 1;
+
     const delay = Math.min(15_000, 800 + crashes * 700);
 
     console.log(
