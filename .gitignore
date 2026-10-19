@@ -1,0 +1,15 @@
+node_modules/
+.project_id
+.github_repo
+.env
+.env.*
+!.env.example
+data/bot-secrets.json
+data/bot-app.json
+data/bot-status.json
+data/bot-want.json
+data/bot.pid
+data/watchdog.pid
+data/jobs/
+data/last/
+artifacts/
