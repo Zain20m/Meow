@@ -5,14 +5,7 @@ ENV BOT_ONLY=1
 ENV PYTHONUNBUFFERED=1
 ENV PYTHON_BIN=/usr/bin/python3
 
-RUN apt-get update 
-&& apt-get install -y --no-install-recommends 
-python3 
-python3-pip 
-ca-certificates 
-&& test -x /usr/bin/python3 
-&& /usr/bin/python3 --version 
-&& rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip ca-certificates && test -x /usr/bin/python3 && /usr/bin/python3 --version && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
