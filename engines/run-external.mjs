@@ -77,6 +77,46 @@ fs.writeFileSync(p, source, "latin1");
 return p;
 }
 
+function resolvePython(env) {
+const candidates = [
+env.PYTHON_BIN,
+"/usr/bin/python3",
+"/usr/local/bin/python3",
+"/bin/python3",
+"python3",
+"python",
+].filter(Boolean);
+
+for (const candidate of candidates) {
+if (path.isAbsolute(candidate)) {
+try {
+fs.accessSync(candidate, fs.constants.X_OK);
+return candidate;
+} catch {
+// Try the next candidate.
+}
+} else {
+const directories = (env.PATH || "").split(path.delimiter);
+
+  for (const directory of directories) {
+    if (!directory) continue;
+
+    const candidatePath = path.join(directory, candidate);
+
+    try {
+      fs.accessSync(candidatePath, fs.constants.X_OK);
+      return candidatePath;
+    } catch {
+      // Try the next directory.
+    }
+  }
+}
+
+}
+
+return null;
+}
+
 export function spawnLogged(
 cmd,
 args,
@@ -88,59 +128,107 @@ const childEnv = {
 ...(env || {}),
 };
 
-const isPython =
-  cmd === "python3" ||
-  cmd === "python" ||
-  cmd === "python3.11";
+const isPython = [
+  "python",
+  "python3",
+  "python3.11",
+].includes(cmd);
 
-const executable = isPython
-  ? (childEnv.PYTHON_BIN || DEFAULT_PYTHON)
-  : cmd;
+let executable = cmd;
 
-const child = spawn(executable, args, {
-  cwd: cwd || ROOT,
-  env: childEnv,
-  stdio: ["ignore", "pipe", "pipe"],
-});
+if (isPython) {
+  executable = resolvePython(childEnv);
+
+  onLog?.(
+    `[PYTHON DEBUG] Requested: ${cmd}`
+  );
+
+  onLog?.(
+    `[PYTHON DEBUG] Selected: ${executable || "NOT FOUND"}`
+  );
+
+  onLog?.(
+    `[PYTHON DEBUG] PYTHON_BIN: ${childEnv.PYTHON_BIN || "(unset)"}`
+  );
+
+  onLog?.(
+    `[PYTHON DEBUG] PATH: ${childEnv.PATH || "(empty)"}`
+  );
+
+  onLog?.(
+    `[PYTHON DEBUG] Working directory: ${cwd || ROOT}`
+  );
+
+  if (!executable) {
+    resolve({
+      code: -1,
+      stdout: "",
+      stderr:
+        "Python executable not found. Checked PYTHON_BIN and standard Python paths. Check the Railway image and deployment logs.",
+      timedOut: false,
+    });
+    return;
+  }
+}
+
+let child;
+
+try {
+  child = spawn(executable, args, {
+    cwd: cwd || ROOT,
+    env: childEnv,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+} catch (error) {
+  resolve({
+    code: -1,
+    stdout: "",
+    stderr: `Failed to start ${executable}: ${error.message}`,
+    timedOut: false,
+  });
+  return;
+}
 
 let stdout = "";
 let stderr = "";
 let settled = false;
+let ping = null;
+let killer = null;
+let forceKiller = null;
 
 const started = Date.now();
 
-const ping = timeoutMs
-  ? setInterval(() => {
-      const elapsed = Date.now() - started;
-      const sec = Math.round(elapsed / 1000);
-      const left = Math.max(
-        0,
-        Math.round((timeoutMs - elapsed) / 1000)
-      );
+if (timeoutMs) {
+  ping = setInterval(() => {
+    const elapsed = Date.now() - started;
+    const sec = Math.round(elapsed / 1000);
+    const left = Math.max(
+      0,
+      Math.round((timeoutMs - elapsed) / 1000)
+    );
 
-      onLog?.(
-        `[~] still running (${sec}s elapsed, ~${left}s budget left)`
-      );
-    }, 8_000)
-  : null;
+    onLog?.(
+      `[~] still running (${sec}s elapsed, ~${left}s budget left)`
+    );
+  }, 8_000);
 
-const killer = timeoutMs
-  ? setTimeout(() => {
-      onLog?.(
-        `[!] timed out after ${Math.round(timeoutMs / 1000)}s — sending stop`
-      );
+  killer = setTimeout(() => {
+    onLog?.(
+      `[!] timed out after ${Math.round(timeoutMs / 1000)}s — sending stop`
+    );
 
-      child.kill("SIGTERM");
+    child.kill("SIGTERM");
 
-      setTimeout(() => {
-        if (!settled) child.kill("SIGKILL");
-      }, 2500);
-    }, timeoutMs)
-  : null;
+    forceKiller = setTimeout(() => {
+      if (!settled) child.kill("SIGKILL");
+    }, 2500);
+  }, timeoutMs);
+}
 
 function cleanup() {
   if (ping) clearInterval(ping);
   if (killer) clearTimeout(killer);
+  if (forceKiller) clearTimeout(forceKiller);
 }
 
 child.stdout.on("data", (data) => {
@@ -169,7 +257,12 @@ child.on("error", (error) => {
   resolve({
     code: -1,
     stdout,
-    stderr: `${stderr}\n${error.message}`.trim(),
+    stderr: [
+      stderr,
+      `[SPAWN ERROR] executable=${executable}`,
+      `[SPAWN ERROR] code=${error.code || "unknown"}`,
+      error.message,
+    ].filter(Boolean).join("\n"),
     timedOut: false,
   });
 });
