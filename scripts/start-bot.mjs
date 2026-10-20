@@ -1,10 +1,7 @@
 
-#!/usr/bin/env node
-
 /**
- * 24/7 Discord bot watchdog.
- * Railway: BOT_ONLY=1 binds PORT and keeps the bot alive forever.
- * Preview: no HTTP bind (Vite owns 8080); still restarts the bot if it dies.
+ * 24/7 Discord bot watchdog for Railway.
+ * Starts bot/index.mjs, restarts it if it exits, and exposes a health endpoint.
  */
 
 import fs from "node:fs";
@@ -13,351 +10,225 @@ import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-const ROOT = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  ".."
-);
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(HERE, "..");
+const BOT_FILE = path.join(ROOT, "bot", "index.mjs");
 
-const DATA = path.join(ROOT, "data");
-const STATUS = path.join(DATA, "bot-status.json");
-const PID = path.join(DATA, "bot.pid");
-const WANT = path.join(DATA, "bot-want.json");
-const WATCHDOG = path.join(DATA, "watchdog.pid");
+const PORT = Number(process.env.PORT || 8080);
+const BOT_ONLY = process.env.BOT_ONLY !== "0";
 
-fs.mkdirSync(DATA, { recursive: true });
+const PATH_DIRS = [
+  "/usr/local/bin",
+  "/usr/bin",
+  "/bin",
+  path.join(ROOT, "vendor", "bin"),
+  path.join(ROOT, "vendor", "Deobfuscator-Luraph-V15-adi", "bin"),
+  path.join(ROOT, "vendor", "luraph-v15-node", "bin"),
+  path.join(ROOT, "vendor", "6vms"),
+  path.join(
+    ROOT,
+    "vendor",
+    "MoonSecV3DeobfuscatorDiscordBot-main",
+    "bin"
+  ),
+];
 
-// Diagnose Python in the actual Railway container.
-const pythonCheck = spawnSync("/usr/bin/python3", ["--version"], {
-  encoding: "utf8",
-  timeout: 5000,
-});
-
-console.log(
-  "[PYTHON CHECK]",
-  JSON.stringify({
-    status: pythonCheck.status,
-    error: pythonCheck.error?.message ?? null,
-    stdout: pythonCheck.stdout?.trim() ?? "",
-    stderr: pythonCheck.stderr?.trim() ?? "",
-  })
-);
-
-const botOnly =
-  process.env.BOT_ONLY === "1" ||
-  Boolean(process.env.RAILWAY_ENVIRONMENT) ||
-  Boolean(process.env.RAILWAY_ENVIRONMENT_ID);
-
-const port = Number(process.env.PORT || (botOnly ? 8080 : 0));
-
-function alive(pid) {
-  if (!pid) return false;
-
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function readJson(p, fallback) {
-  try {
-    return JSON.parse(fs.readFileSync(p, "utf8"));
-  } catch {
-    return fallback;
-  }
-}
-
-function writeJson(p, obj) {
-  fs.writeFileSync(p, JSON.stringify(obj, null, 2));
-}
-
-function wantRunning() {
-  const w = readJson(WANT, { running: true });
-  return w.running !== false;
-}
-
-const CONFIG = path.join(DATA, "bot-secrets.json");
-
-function appIdFromToken(token) {
-  const part = String(token || "").split(".")[0];
-
-  if (!part) return "";
-
-  try {
-    const id = Buffer.from(part, "base64")
-      .toString("utf8")
-      .replace(/\0/g, "")
-      .trim();
-
-    return /^\d{17,22}$/.test(id) ? id : "";
-  } catch {
-    return "";
-  }
-}
-
-function readToken() {
-  let file = {};
-  let mtime = 0;
-
-  try {
-    mtime = fs.statSync(CONFIG).mtimeMs;
-    file = JSON.parse(fs.readFileSync(CONFIG, "utf8"));
-  } catch {
-    file = {};
-  }
-
-  const token = String(
-    file.token || process.env.DISCORD_BOT_TOKEN || ""
-  ).trim();
-
-  const appId = String(
-    file.appId ||
-      process.env.DISCORD_APP_ID ||
-      appIdFromToken(token) ||
-      ""
-  ).trim();
-
-  return { token, appId, mtime };
-}
-
-let holdUntilTokenChanges = 0;
-
-if (fs.existsSync(WATCHDOG)) {
-  const old = Number(fs.readFileSync(WATCHDOG, "utf8"));
-
-  if (old && old !== process.pid && alive(old)) {
-    console.log("[watchdog] already running pid", old);
-    process.exit(0);
-  }
-}
-
-fs.writeFileSync(WATCHDOG, String(process.pid));
-
-let child = null;
-let restartTimer = null;
-let crashes = 0;
-
-function spawnBot() {
-  const { token, appId, mtime } = readToken();
-
-  if (!token) {
-    writeJson(STATUS, {
-      online: false,
-      error: "missing token",
-      updatedAt: Date.now(),
-    });
-    return;
-  }
-
-  if (holdUntilTokenChanges && mtime === holdUntilTokenChanges) {
-    return;
-  }
-
-  if (holdUntilTokenChanges && mtime !== holdUntilTokenChanges) {
-    holdUntilTokenChanges = 0;
-  }
-
-  if (child && child.exitCode === null) return;
-
-  const vendor = path.join(ROOT, "vendor");
-
-  const extras = [
-    path.join(vendor, "bin"),
-    path.join(vendor, "Deobfuscator-Luraph-V15-adi", "bin"),
-    path.join(vendor, "luraph-v15-node", "bin"),
-    path.join(vendor, "6vms"),
-    path.join(
-      vendor,
-      "MoonSecV3DeobfuscatorDiscordBot-main",
-      "bin"
-    ),
-  ];
-
-  // Preserve system directories so Python and other system tools remain discoverable.
-  const systemPaths = [
-    "/usr/local/bin",
-    "/usr/bin",
-    "/bin",
+const ENV = {
+  ...process.env,
+  PATH: [
+    ...PATH_DIRS,
     process.env.PATH || "",
+  ].filter(Boolean).join(path.delimiter),
+  PYTHONUNBUFFERED: "1",
+  PYTHON_BIN: process.env.PYTHON_BIN || "/usr/bin/python3",
+  PYTHONPATH: [
+    path.join(ROOT, "vendor", "luau-vmp-deobf"),
+    process.env.PYTHONPATH || "",
+  ].filter(Boolean).join(path.delimiter),
+};
+
+let bot = null;
+let stopping = false;
+let restartTimer = null;
+let restartDelay = 2000;
+let lastExit = null;
+let startedAt = Date.now();
+
+function log(...args) {
+  console.log(new Date().toISOString(), "[WATCHDOG]", ...args);
+}
+
+function checkPython() {
+  const candidates = [
+    ENV.PYTHON_BIN,
+    "/usr/bin/python3",
+    "/usr/local/bin/python3",
+    "python3",
+    "python",
   ];
 
-  const childEnv = {
-    ...process.env,
-    DISCORD_BOT_TOKEN: token,
-    DISCORD_APP_ID: appId,
-    PATH: [...extras, ...systemPaths].join(path.delimiter),
-    PYTHON_BIN: process.env.PYTHON_BIN || "/usr/bin/python3",
-    PYTHONPATH: [
-      path.join(vendor, "luau-vmp-deobf"),
-      process.env.PYTHONPATH || "",
-    ]
-      .filter(Boolean)
-      .join(path.delimiter),
-    PYTHONUNBUFFERED: "1",
-  };
+  const seen = new Set();
 
-  let errBuf = "";
+  for (const candidate of candidates) {
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
 
-  child = spawn(
-    process.execPath,
-    [path.join(ROOT, "bot", "index.mjs")],
-    {
+    const result = spawnSync(candidate, ["--version"], {
       cwd: ROOT,
-      env: childEnv,
-      stdio: ["ignore", "pipe", "pipe"],
+      env: ENV,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+
+    log("[PYTHON CHECK]", JSON.stringify({
+      candidate,
+      status: result.status,
+      error: result.error?.message || null,
+      stdout: (result.stdout || "").trim(),
+      stderr: (result.stderr || "").trim(),
+    }));
+
+    if (!result.error && result.status === 0) {
+      ENV.PYTHON_BIN = candidate;
+      log("[PYTHON SELECTED]", candidate);
+      return candidate;
     }
-  );
+  }
 
-  fs.writeFileSync(PID, String(child.pid || ""));
+  log("[PYTHON WARNING] No working Python executable found.");
+  return null;
+}
 
-  writeJson(STATUS, {
-    online: false,
-    error: "connecting",
-    updatedAt: Date.now(),
+function startBot() {
+  if (stopping || bot) return;
+
+  if (!fs.existsSync(BOT_FILE)) {
+    log("[FATAL] Bot entry file does not exist:", BOT_FILE);
+    process.exitCode = 1;
+    return;
+  }
+
+  log("[START] Launching bot:", BOT_FILE);
+
+  bot = spawn(process.execPath, [BOT_FILE], {
+    cwd: ROOT,
+    env: ENV,
+    stdio: ["ignore", "inherit", "inherit"],
   });
 
-  child.stdout?.on("data", (d) => {
-    process.stdout.write("[bot] " + d);
-  });
-
-  child.stderr?.on("data", (d) => {
-    errBuf = (errBuf + d.toString()).slice(-2000);
-    process.stderr.write("[bot] " + d);
-  });
+  const child = bot;
 
   child.on("error", (error) => {
-    errBuf = (errBuf + "\n" + error.message).slice(-2000);
-    console.error("[watchdog] spawn error:", error.message);
+    log("[BOT SPAWN ERROR]", error.stack || error.message);
   });
 
   child.on("exit", (code, signal) => {
-    child = null;
+    if (bot === child) bot = null;
 
-    const stopped = !wantRunning();
-    const invalid = /TokenInvalid|invalid token/i.test(errBuf);
+    lastExit = {
+      code,
+      signal,
+      at: new Date().toISOString(),
+    };
 
-    if (invalid) {
-      holdUntilTokenChanges = mtime;
+    log("[BOT EXIT]", JSON.stringify(lastExit));
 
-      writeJson(STATUS, {
-        online: false,
-        error:
-          "Invalid bot token. Update the token in the Discord Developer Portal configuration.",
-        updatedAt: Date.now(),
-      });
+    if (stopping) return;
 
-      console.log(
-        "[watchdog] token rejected — waiting for a new token"
-      );
+    log("[RESTART] Bot exited. Restarting in", restartDelay, "ms.");
 
-      return;
-    }
+    restartTimer = setTimeout(() => {
+      restartTimer = null;
+      restartDelay = Math.min(restartDelay * 2, 30000);
+      startBot();
+    }, restartDelay);
+  });
 
-    writeJson(STATUS, {
-      online: false,
-      error: stopped ? "stopped" : `exit ${code ?? signal}`,
-      updatedAt: Date.now(),
-    });
-
-    if (stopped) return;
-
-    crashes += 1;
-
-    const delay = Math.min(15_000, 800 + crashes * 700);
-
-    console.log(
-      `[watchdog] bot exited ${code ?? signal} — restart in ${delay}ms`
-    );
-
-    clearTimeout(restartTimer);
-    restartTimer = setTimeout(spawnBot, delay);
+  child.on("spawn", () => {
+    restartDelay = 2000;
+    log("[BOT ONLINE] Child process started.");
   });
 }
 
-function tick() {
-  const { token } = readToken();
-  const running = wantRunning();
+function stopBot(signal = "SIGTERM") {
+  stopping = true;
 
-  const botPid = Number(
-    fs.existsSync(PID) ? fs.readFileSync(PID, "utf8") : 0
-  );
-
-  if (!running) {
-    if (child && child.exitCode === null) {
-      try {
-        child.kill("SIGTERM");
-      } catch {
-        // Ignore shutdown errors.
-      }
-    } else if (alive(botPid)) {
-      try {
-        process.kill(botPid, "SIGTERM");
-      } catch {
-        // Ignore shutdown errors.
-      }
-    }
-
-    return;
+  if (restartTimer) {
+    clearTimeout(restartTimer);
+    restartTimer = null;
   }
 
-  if (!token) return;
-  if (child && child.exitCode === null) return;
-  if (alive(botPid) && !child) return;
-
-  spawnBot();
+  if (bot && !bot.killed) {
+    log("[STOP] Sending", signal, "to bot.");
+    bot.kill(signal);
+  }
 }
 
-tick();
-setInterval(tick, 4000);
-
-if (botOnly && port) {
+function startHealthServer() {
   const server = http.createServer((req, res) => {
-    const url = req.url?.split("?")[0] || "/";
-
-    if (
-      url === "/health" ||
-      url === "/" ||
-      url === "/api/health"
-    ) {
-      const st = readJson(STATUS, {});
-
-      const body = JSON.stringify({
+    if (req.url === "/health" || req.url === "/") {
+      const body = {
         ok: true,
-        service: "6.5mz-deobf",
-        bot: st.online === true,
-        username: st.username || null,
-        error: st.error || null,
-      });
+        watchdog: "running",
+        botRunning: Boolean(bot),
+        uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
+        lastExit,
+        pythonBin: ENV.PYTHON_BIN,
+      };
 
       res.writeHead(200, {
-        "content-type": "application/json",
+        "content-type": "application/json; charset=utf-8",
         "cache-control": "no-store",
       });
-
-      res.end(body);
+      res.end(JSON.stringify(body, null, 2));
       return;
     }
 
-    res.writeHead(404);
-    res.end("not found");
+    res.writeHead(404, {
+      "content-type": "application/json; charset=utf-8",
+    });
+    res.end(JSON.stringify({ error: "Not found" }));
   });
 
-  server.listen(port, "0.0.0.0", () => {
-    console.log(
-      `[watchdog] health on 0.0.0.0:${port} bot-only=${botOnly}`
-    );
+  server.listen(PORT, "0.0.0.0", () => {
+    log("[HTTP] Health server listening on port", PORT);
   });
+
+  server.on("error", (error) => {
+    log("[HTTP ERROR]", error.stack || error.message);
+  });
+
+  return server;
 }
 
-process.on("SIGTERM", () => {
-  try {
-    child?.kill("SIGTERM");
-  } catch {
-    // Ignore shutdown errors.
+log("[BOOT] Root:", ROOT);
+log("[BOOT] Node:", process.version);
+log("[BOOT] BOT_ONLY:", BOT_ONLY);
+log("[BOOT] Bot entry exists:", fs.existsSync(BOT_FILE));
+
+checkPython();
+
+let healthServer = null;
+
+if (BOT_ONLY) {
+  healthServer = startHealthServer();
+}
+
+startBot();
+
+function shutdown(signal) {
+  log("[SHUTDOWN]", signal);
+  stopBot("SIGTERM");
+
+  if (healthServer) {
+    healthServer.close();
   }
 
-  process.exit(0);
-});
+  setTimeout(() => {
+    if (bot) bot.kill("SIGKILL");
+    process.exit(0);
+  }, 5000).unref();
+}
 
-console.log("[watchdog] 6.5mz deobf watchdog online");
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
