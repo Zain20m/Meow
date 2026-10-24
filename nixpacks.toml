@@ -6,3 +6,6 @@ cmds = ["npm install --omit=dev --no-audit --no-fund"]
 
 [start]
 cmd = "node scripts/start-bot.mjs"
+
+[variables]
+PYTHON_BIN = "python3"
